@@ -16,7 +16,7 @@ bind_interrupts!(struct Irqs {
 
 #[embassy_executor::main(entry = "ch32_hal::entry")]
 async fn main(_spawner: Spawner) -> ! {
-    hal::debug::SDIPrint::enable();
+    hal::debug::rtt_init();
     let mut config = hal::Config::default();
     config.rcc = hal::rcc::Config::SYSCLK_FREQ_96MHZ_HSI;
     let p = hal::init(config);

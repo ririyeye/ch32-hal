@@ -82,6 +82,11 @@ impl Timeout {
 pub mod rcc;
 
 pub mod debug;
+
+// Re-export rtt_target so the println! macro can refer to $crate::rtt_target
+#[cfg(feature = "rtt-debug")]
+pub use rtt_target;
+
 pub mod prelude;
 
 mod peripheral;

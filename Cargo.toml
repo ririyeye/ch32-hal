@@ -30,6 +30,7 @@ embedded-can = "0.4.1"
 
 critical-section = { version = "1.2.0" }
 defmt = { version = "0.3.8", optional = true }
+rtt-target = { version = "0.6", optional = true }
 
 embassy-sync = { version = "0.7.2" }
 embassy-futures = { version = "0.1.1" }
@@ -69,6 +70,7 @@ embassy = [
     "dep:embassy-time",
 ]
 defmt = ["dep:defmt"]
+rtt-debug = ["dep:rtt-target"]
 memory-x = ["ch32-metapac/memory-x"]
 
 

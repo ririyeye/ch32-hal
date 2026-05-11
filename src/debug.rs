@@ -4,6 +4,8 @@
 
 use qingke::riscv;
 
+// ── SDI print (WCH-LinkE) ──────────────────────────────────────────
+
 #[cfg(any(qingke_v3, qingke_v4))]
 mod regs {
     pub const DEBUG_DATA0_ADDRESS: *mut u32 = 0xE000_0380 as *mut u32;
@@ -56,25 +58,53 @@ impl core::fmt::Write for SDIPrint {
     }
 }
 
+// ── RTT init ────────────────────────────────────────────────────────
+
+/// Initialize RTT for debug output. Call once at the start of `main`.
+#[cfg(feature = "rtt-debug")]
+pub fn rtt_init() {
+    rtt_target::rtt_init_print!();
+}
+
+// ── Print macros ────────────────────────────────────────────────────
+
+/// println! via RTT when feature `rtt-debug` is enabled, via SDI otherwise.
+#[cfg(feature = "rtt-debug")]
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {
+        $crate::rtt_target::rprintln!($($arg)*);
+    }
+}
+
+#[cfg(not(feature = "rtt-debug"))]
 #[macro_export]
 macro_rules! println {
     ($($arg:tt)*) => {
         {
             use core::fmt::Write;
             use core::writeln;
-
             writeln!(&mut $crate::debug::SDIPrint, $($arg)*).unwrap();
         }
     }
 }
 
+/// print! via RTT when feature `rtt-debug` is enabled, via SDI otherwise.
+#[cfg(feature = "rtt-debug")]
+#[macro_export]
+macro_rules! print {
+    ($($arg:tt)*) => {
+        $crate::rtt_target::rprint!($($arg)*);
+    }
+}
+
+#[cfg(not(feature = "rtt-debug"))]
 #[macro_export]
 macro_rules! print {
     ($($arg:tt)*) => {
         {
             use core::fmt::Write;
             use core::write;
-
             write!(&mut $crate::debug::SDIPrint, $($arg)*).unwrap();
         }
     }
