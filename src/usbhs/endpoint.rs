@@ -5,26 +5,34 @@ use core::task::Poll;
 use ch32_metapac::usbhs::vals::{EpRxResponse, EpTog, EpTxResponse, UsbToken};
 use embassy_usb_driver::{Direction, EndpointError, EndpointIn, EndpointInfo, EndpointOut, EndpointType};
 
-use super::{EndpointData, Instance, EP_WAKERS};
+use super::{pipe, EndpointData, Instance, EP_WAKERS};
 use crate::usb::{Dir, In, Out};
 
 pub struct Endpoint<'d, T: Instance, D: Dir, const SIZE: usize> {
     _phantom: PhantomData<(&'d mut T, D)>,
     info: EndpointInfo,
     pub(crate) data: EndpointData<'d, SIZE>,
+    /// 是否走了 pipe.rs 的深队列 DMA ring（非 control 且拿到 ring）。
+    ring: bool,
 }
 
 impl<'d, T: Instance, D: Dir, const SIZE: usize> Endpoint<'d, T, D, SIZE> {
     pub(crate) fn new(info: EndpointInfo, data: EndpointData<'d, SIZE>) -> Self {
         let index = info.addr.index();
         T::dregs().ep_max_len(index).write(|v| v.set_len(info.max_packet_size));
+        let mut ring = false;
         if info.ep_type != EndpointType::Control {
-            match info.addr.direction() {
-                Direction::Out => {
-                    T::dregs().ep_rx_dma(index - 1).write_value(data.buffer.addr() as u32);
-                }
-                Direction::In => {
-                    T::dregs().ep_tx_dma(index - 1).write_value(data.buffer.addr() as u32);
+            if pipe::RING_ENABLE && info.max_packet_size <= 512 {
+                ring = pipe::init::<T>(index, info.addr.direction() == Direction::In);
+            }
+            if !ring {
+                match info.addr.direction() {
+                    Direction::Out => {
+                        T::dregs().ep_rx_dma(index - 1).write_value(data.buffer.addr() as u32);
+                    }
+                    Direction::In => {
+                        T::dregs().ep_tx_dma(index - 1).write_value(data.buffer.addr() as u32);
+                    }
                 }
             }
         }
@@ -32,6 +40,7 @@ impl<'d, T: Instance, D: Dir, const SIZE: usize> Endpoint<'d, T, D, SIZE> {
             _phantom: PhantomData,
             info,
             data,
+            ring,
         }
     }
 
@@ -178,6 +187,25 @@ impl<'d, T: Instance, const SIZE: usize> EndpointOut for Endpoint<'d, T, Out, SI
             return Err(EndpointError::BufferOverflow);
         }
 
+        if self.ring {
+            // 深队列：等 ring 里有包，取一格；取完立刻补挂，尽量保持流水不断。
+            let (addr, len) = poll_fn(|ctx| {
+                EP_WAKERS[index].register(ctx.waker());
+                if let Some(pkt) = pipe::take_rx(index) {
+                    pipe::resume_rx::<T>(index);
+                    Poll::Ready(pkt)
+                } else {
+                    // 首次读 / 环空：挂上 RX 等数据
+                    pipe::resume_rx::<T>(index);
+                    Poll::Pending
+                }
+            })
+            .await;
+            let n = (len as usize).min(buf.len());
+            pipe::copy_from(addr, buf, n);
+            return Ok(n);
+        }
+
         d.ep_rx_ctrl(index).modify(|v| {
             v.set_mask_uep_r_res(EpRxResponse::ACK);
         });
@@ -195,6 +223,23 @@ impl<'d, T: Instance, const SIZE: usize> EndpointIn for Endpoint<'d, T, In, SIZE
 
         let d = T::dregs();
         let index = self.info.addr.index();
+
+        if self.ring {
+            // 深队列：拷进 ring 槽即入队返回（数据已安全），发完由 ISR 续挂下一包。
+            if buf.len() > self.data.max_packet_size as usize {
+                return Err(EndpointError::BufferOverflow);
+            }
+            return poll_fn(|ctx| {
+                EP_WAKERS[index].register(ctx.waker());
+                if pipe::try_tx_submit::<T>(index, buf) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    // 队列满，等 IN 完成腾出槽
+                    Poll::Pending
+                }
+            })
+            .await;
+        }
 
         self.data_in_write_buffer(buf)?;
 

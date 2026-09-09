@@ -51,6 +51,15 @@ use crate::{interrupt, Peri, PeripheralType};
 
 pub mod control;
 mod endpoint;
+mod pipe;
+pub use pipe::dbg_state as pipe_dbg;
+/// 只读访问调试计数。
+pub fn evt_rx_count() -> u32 {
+    pipe::evt_rx()
+}
+pub fn evt_tx_count() -> u32 {
+    pipe::evt_tx()
+}
 
 const MAX_NR_EP: usize = 16;
 const EP_MAX_PACKET_SIZE: u16 = 64;
@@ -87,20 +96,36 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         };
         if flag.transfer() {
             let status = r.int_st().read();
+            let ep = status.endp() as usize;
 
             match status.token() {
                 UsbToken::OUT => {
                     if status.tog_ok() {
-                        EP_WAKERS[status.endp() as usize].wake();
-                        r.int_en().modify(|w| w.set_transfer(false));
+                        if pipe::is_ring(ep) {
+                            let len = r.rx_len().read();
+                            // on_out 内已清 UIF_TRANSFER；只在 filled 0→1 时 wake
+                            if pipe::on_out::<T>(ep, len) {
+                                EP_WAKERS[ep].wake();
+                            }
+                        } else {
+                            EP_WAKERS[ep].wake();
+                            r.int_en().modify(|w| w.set_transfer(false));
+                        }
                     } else {
                         // If `tog` is wrong, keep NAK and wait for a "resend"
                         r.int_fg().write(|v| v.set_transfer(true));
                     }
                 }
                 UsbToken::IN => {
-                    EP_WAKERS[status.endp() as usize].wake();
-                    r.int_en().modify(|w| w.set_transfer(false));
+                    if pipe::is_ring(ep) {
+                        // on_in 内已清 UIF_TRANSFER；只在队列从满到非满时 wake
+                        if pipe::on_in::<T>(ep) {
+                            EP_WAKERS[ep].wake();
+                        }
+                    } else {
+                        EP_WAKERS[ep].wake();
+                        r.int_en().modify(|w| w.set_transfer(false));
+                    }
                 }
                 // SETUP
                 t @ (UsbToken::SOF | UsbToken::SETUP) => {
@@ -339,6 +364,8 @@ impl<'d, T: Instance> Bus<'d, T> {
         d.ep_config().write_value(EpConfig::default());
         d.ep_type().write_value(EpType::default());
         d.ep_buf_mod().write_value(EpBufMod::default());
+        // 清 ring 状态（DMA 基址在 endpoint_set_enabled 时重新挂）
+        pipe::reset_all();
     }
 }
 
@@ -388,6 +415,7 @@ impl<'d, T: Instance> embassy_usb_driver::Bus for Bus<'d, T> {
 
     fn endpoint_set_enabled(&mut self, ep_addr: EndpointAddress, enabled: bool) {
         let index = ep_addr.index();
+        let dir_in = ep_addr.direction() == Direction::In;
 
         critical_section::with(|_| match ep_addr.direction() {
             Direction::Out => {
@@ -407,6 +435,8 @@ impl<'d, T: Instance> embassy_usb_driver::Bus for Bus<'d, T> {
                 });
             }
         });
+        // ring 端点：复位队列并重新挂 RX DMA 基址（TX 首次 submit 时挂）
+        pipe::on_enable::<T>(index, enabled, dir_in);
         EP_WAKERS[ep_addr.index()].wake();
     }
 
