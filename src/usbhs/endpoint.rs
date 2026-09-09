@@ -12,27 +12,21 @@ pub struct Endpoint<'d, T: Instance, D: Dir, const SIZE: usize> {
     _phantom: PhantomData<(&'d mut T, D)>,
     info: EndpointInfo,
     pub(crate) data: EndpointData<'d, SIZE>,
-    /// 是否走了 pipe.rs 的深队列 DMA ring（非 control 且拿到 ring）。
-    ring: bool,
 }
 
 impl<'d, T: Instance, D: Dir, const SIZE: usize> Endpoint<'d, T, D, SIZE> {
     pub(crate) fn new(info: EndpointInfo, data: EndpointData<'d, SIZE>) -> Self {
         let index = info.addr.index();
         T::dregs().ep_max_len(index).write(|v| v.set_len(info.max_packet_size));
-        let mut ring = false;
+        // ring 内存由外部注入（pipe::init_tx / init_rx），这里只挂 legacy 单缓冲 DMA。
+        // 是否走 ring 由 is_ring() 动态查 pipe::is_ring(index) 决定，注入可在 new 之后。
         if info.ep_type != EndpointType::Control {
-            if pipe::RING_ENABLE && info.max_packet_size <= 512 {
-                ring = pipe::init::<T>(index, info.addr.direction() == Direction::In);
-            }
-            if !ring {
-                match info.addr.direction() {
-                    Direction::Out => {
-                        T::dregs().ep_rx_dma(index - 1).write_value(data.buffer.addr() as u32);
-                    }
-                    Direction::In => {
-                        T::dregs().ep_tx_dma(index - 1).write_value(data.buffer.addr() as u32);
-                    }
+            match info.addr.direction() {
+                Direction::Out => {
+                    T::dregs().ep_rx_dma(index - 1).write_value(data.buffer.addr() as u32);
+                }
+                Direction::In => {
+                    T::dregs().ep_tx_dma(index - 1).write_value(data.buffer.addr() as u32);
                 }
             }
         }
@@ -40,8 +34,17 @@ impl<'d, T: Instance, D: Dir, const SIZE: usize> Endpoint<'d, T, D, SIZE> {
             _phantom: PhantomData,
             info,
             data,
-            ring,
         }
+    }
+
+    /// 该端点是否已挂上 pipe.rs 的深队列 ring（由外部 `pipe::init_tx/init_rx` 注入）。
+    pub fn is_ring(&self) -> bool {
+        pipe::is_ring(self.info.addr.index())
+    }
+
+    /// 端点号（EP0 = 0）。
+    pub fn ep_index(&self) -> usize {
+        self.info.addr.index()
     }
 
     async fn wait_enabled_internal(&mut self) {
@@ -187,22 +190,14 @@ impl<'d, T: Instance, const SIZE: usize> EndpointOut for Endpoint<'d, T, Out, SI
             return Err(EndpointError::BufferOverflow);
         }
 
-        if self.ring {
-            // 深队列：等 ring 里有包，取一格；取完立刻补挂，尽量保持流水不断。
-            let (addr, len) = poll_fn(|ctx| {
-                EP_WAKERS[index].register(ctx.waker());
-                if let Some(pkt) = pipe::take_rx(index) {
-                    pipe::resume_rx::<T>(index);
-                    Poll::Ready(pkt)
-                } else {
-                    // 首次读 / 环空：挂上 RX 等数据
-                    pipe::resume_rx::<T>(index);
-                    Poll::Pending
-                }
-            })
-            .await;
-            let n = (len as usize).min(buf.len());
-            pipe::copy_from(addr, buf, n);
+        if self.is_ring() {
+            // 深队列零拷贝：等 ring 里有包，取一块 DMA buffer，再拷到用户 buf（trait
+            // 边界必须拷一次），取完 release 自动补挂。要真正零拷贝请直接用 rx_pipe()。
+            let rx = pipe::RxPipe::<T>::new(index);
+            let pkt = rx.recv().await;
+            let n = pkt.len().min(buf.len());
+            buf[..n].copy_from_slice(pkt.data());
+            rx.release(pkt);
             return Ok(n);
         }
 
@@ -224,21 +219,18 @@ impl<'d, T: Instance, const SIZE: usize> EndpointIn for Endpoint<'d, T, In, SIZE
         let d = T::dregs();
         let index = self.info.addr.index();
 
-        if self.ring {
-            // 深队列：拷进 ring 槽即入队返回（数据已安全），发完由 ISR 续挂下一包。
+        if self.is_ring() {
+            // 深队列零拷贝：alloc 一块 DMA buffer，从用户 buf 拷进去（trait 边界必须
+            // 拷一次），submit 入队。要真正零拷贝请直接用 tx_pipe()。
             if buf.len() > self.data.max_packet_size as usize {
                 return Err(EndpointError::BufferOverflow);
             }
-            return poll_fn(|ctx| {
-                EP_WAKERS[index].register(ctx.waker());
-                if pipe::try_tx_submit::<T>(index, buf) {
-                    Poll::Ready(Ok(()))
-                } else {
-                    // 队列满，等 IN 完成腾出槽
-                    Poll::Pending
-                }
-            })
-            .await;
+            let tx = pipe::TxPipe::<T>::new(index);
+            let mut slot = tx.alloc().await;
+            let n = buf.len().min(slot.capacity());
+            slot.buf()[..n].copy_from_slice(&buf[..n]);
+            tx.submit(slot, n as u16);
+            return Ok(());
         }
 
         self.data_in_write_buffer(buf)?;
@@ -248,5 +240,21 @@ impl<'d, T: Instance, const SIZE: usize> EndpointIn for Endpoint<'d, T, In, SIZE
         });
 
         self.data_in_transfer().await
+    }
+}
+
+// ───────────── 直接零拷贝句柄：绕过 embassy trait，DMA buffer 直接递交 ─────────────
+
+impl<'d, T: Instance, const SIZE: usize> Endpoint<'d, T, In, SIZE> {
+    /// 拿 TX(IN) 零拷贝 pipe 句柄。调用方须先 `pipe::init_tx::<T>(ep_index, slots)` 注入内存。
+    pub fn tx_pipe(&self) -> pipe::TxPipe<T> {
+        pipe::TxPipe::<T>::new(self.info.addr.index())
+    }
+}
+
+impl<'d, T: Instance, const SIZE: usize> Endpoint<'d, T, Out, SIZE> {
+    /// 拿 RX(OUT) 零拷贝 pipe 句柄。调用方须先 `pipe::init_rx::<T>(ep_index, slots)` 注入内存。
+    pub fn rx_pipe(&self) -> pipe::RxPipe<T> {
+        pipe::RxPipe::<T>::new(self.info.addr.index())
     }
 }

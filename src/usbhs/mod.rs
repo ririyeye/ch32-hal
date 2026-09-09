@@ -42,7 +42,6 @@ use embassy_sync::waitqueue::AtomicWaker;
 use embassy_usb_driver::{
     Direction, EndpointAddress, EndpointAllocError, EndpointInfo, EndpointType, Event, Unsupported,
 };
-use endpoint::Endpoint;
 
 use crate::gpio::{AFType, Speed};
 use crate::interrupt::typelevel::Interrupt;
@@ -51,8 +50,10 @@ use crate::{interrupt, Peri, PeripheralType};
 
 pub mod control;
 mod endpoint;
+pub use endpoint::Endpoint;
 mod pipe;
 pub use pipe::dbg_state as pipe_dbg;
+pub use pipe::{init_rx, init_tx, DmaSlot, RxPipe, TxPipe};
 /// 只读访问调试计数。
 pub fn evt_rx_count() -> u32 {
     pipe::evt_rx()
