@@ -78,8 +78,9 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         let r = T::regs();
         let flag = r.int_fg().read();
 
-        assert!(!flag.fifo_ov());
-
+        if flag.fifo_ov() {
+            r.int_fg().write(|v| v.set_fifo_ov(true));
+        }
         if flag.bus_rst() {
             //mask the interrupt and let the main thread handle it
             r.int_en().modify(|w| w.set_bus_rst(false));
@@ -104,7 +105,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     if status.tog_ok() {
                         if pipe::is_ring(ep) {
                             let len = r.rx_len().read();
-                            // on_out 内已清 UIF_TRANSFER；只在 filled 0→1 时 wake
+                            // on_out 内改完环再清 UIF_TRANSFER；只在 filled 0→1 时 wake
                             if pipe::on_out::<T>(ep, len) {
                                 EP_WAKERS[ep].wake();
                             }
@@ -119,7 +120,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                 }
                 UsbToken::IN => {
                     if pipe::is_ring(ep) {
-                        // on_in 内已清 UIF_TRANSFER；只在队列从满到非满时 wake
+                        // on_in 内改完环再清 UIF_TRANSFER；只在队列从满到非满时 wake
                         if pipe::on_in::<T>(ep) {
                             EP_WAKERS[ep].wake();
                         }
