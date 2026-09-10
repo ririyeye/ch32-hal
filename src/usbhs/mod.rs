@@ -53,7 +53,9 @@ mod endpoint;
 pub use endpoint::Endpoint;
 mod pipe;
 pub use pipe::dbg_state as pipe_dbg;
-pub use pipe::{init_rx, init_tx, DmaSlot, RxPipe, TxPipe};
+pub use pipe::{
+    cyc_raw, init_rx, init_tx, metrics, metrics_clear, metrics_init, DmaSlot, RxPipe, TxPipe,
+};
 /// 只读访问调试计数。
 pub fn evt_rx_count() -> u32 {
     pipe::evt_rx()
@@ -75,6 +77,8 @@ pub struct InterruptHandler<T: Instance> {
 
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
+        // 计量 ISR 长度：这段就是 `UIF_TRANSFER` 有效、SIE 自动 NAK 的窗口。
+        let _t0 = pipe::metrics_enter();
         let r = T::regs();
         let flag = r.int_fg().read();
 
@@ -138,6 +142,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         if flag.hst_sof() {
             r.int_fg().write(|v| v.set_hst_sof(true));
         }
+        pipe::metrics_exit(_t0);
     }
 }
 

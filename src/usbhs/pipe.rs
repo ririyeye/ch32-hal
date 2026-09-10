@@ -40,6 +40,20 @@ const QMASK: u8 = 15;
 /// 调试开关：false 时 `init_tx` / `init_rx` 拒绝挂 ring，端点退回单缓冲 legacy 路径。
 pub const RING_ENABLE: bool = true;
 
+/// TX(IN) 唤醒水位：free 队列涨到 `n / TX_WAKE_DIV` 格才唤醒生产者一次。
+///
+/// 1 = 每包都唤醒（老行为）。每唤醒一次，executor 都要把整个任务（含 `usb.run()`）
+/// 重新轮询一遍，测速时那就是每包都要付的固定开销。设成 2 表示「攒到半个环再补」，
+/// 生产者一次补满，唤醒次数减半，而队列仍有 `n/2` 的余量不会见底。
+const TX_WAKE_DIV: u8 = 2;
+
+/// 生产者该不该被唤醒：free 队列长度到水位了。
+#[inline(always)]
+fn tx_wake_water(n: u8) -> u8 {
+    let w = n / TX_WAKE_DIV;
+    if w == 0 { 1 } else { w }
+}
+
 #[inline(always)]
 fn wrap(i: u8) -> u8 {
     (i + 1) & QMASK
@@ -232,6 +246,105 @@ static mut RX: [RxCtx; EP_N] = [RxCtx::empty(); EP_N];
 static RING_BITS: AtomicU16 = AtomicU16::new(0);
 static EVT_RX: AtomicU32 = AtomicU32::new(0);
 static EVT_TX: AtomicU32 = AtomicU32::new(0);
+
+// ───────────────────────── 诊断计数 ─────────────────────────
+//
+// 用来定位「一包要 20~30 µs，线上只要 10 µs」这类问题：
+// - `DRY_*`：ISR 里队列空、只能给 NAK 的次数。它高说明瓶颈在应用侧喂不动 ring，
+//   而不是 `INT_BUSY` 窗口；它接近 0 说明 ring 一直是满的，卡在别处。
+// - `ISR_SUM/ISR_MAX`：ISR 从进到出的周期数。这就是 `UIF_TRANSFER` 有效、
+//   硬件对后续 token 自动 NAK 的窗口长度。
+// - `GAP_MAX`：两次 ISR 之间的最大间隔，即最坏情况下一包花了多久。
+
+static ISR_N: AtomicU32 = AtomicU32::new(0);
+static ISR_SUM: AtomicU32 = AtomicU32::new(0);
+static ISR_MAX: AtomicU32 = AtomicU32::new(0);
+static GAP_MAX: AtomicU32 = AtomicU32::new(0);
+static LAST_ENTER: AtomicU32 = AtomicU32::new(0);
+static DRY_RX: AtomicU32 = AtomicU32::new(0);
+static DRY_TX: AtomicU32 = AtomicU32::new(0);
+
+/// 青稞内核自带的 SysTick 计数器（`0xE000F000`，`CNT` 在 +8，64 位递增）。
+/// 只取低 32 位做差分：HCLK=144MHz 时约 30 s 回绕一次，够用。
+#[inline(always)]
+fn cyc() -> u32 {
+    unsafe { core::ptr::read_volatile(0xE000_F008 as *const u32) }
+}
+
+/// 当前周期计数值（用于标定计数器频率：Δcounts / Δt）。
+#[inline(always)]
+pub fn cyc_raw() -> u32 {
+    cyc()
+}
+
+/// 启动自由运行的周期计数器（`CTLR.STRE=1`，HCLK 递增，不开中断）。
+pub fn metrics_init() {
+    unsafe {
+        let base = 0xE000_F000 as *mut u32;
+        base.add(0).write_volatile(0); // CTLR 停
+        base.add(1).write_volatile(0); // SR 清
+        base.add(2).write_volatile(0); // CNT 低
+        base.add(3).write_volatile(0); // CNT 高
+        base.add(4).write_volatile(0xFFFF_FFFF); // CMP 低
+        base.add(5).write_volatile(0xFFFF_FFFF); // CMP 高
+        base.add(0).write_volatile(1); // CTLR.STRE=1，HCLK 递增
+    }
+}
+
+/// ISR 入口调用：记录间隔并返回时间戳。
+#[inline(always)]
+pub fn metrics_enter() -> u32 {
+    let t = cyc();
+    let last = LAST_ENTER.load(Ordering::Relaxed);
+    LAST_ENTER.store(t, Ordering::Relaxed);
+    if last != 0 {
+        // 用无符号回绕差分；跨过 0 也没关系。
+        let gap = t.wrapping_sub(last);
+        if gap > GAP_MAX.load(Ordering::Relaxed) {
+            GAP_MAX.store(gap, Ordering::Relaxed);
+        }
+    }
+    ISR_N.store(
+        ISR_N.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+    t
+}
+
+/// ISR 出口调用：累计 ISR 时长（含入口/出口的 trap 开销之外的部分）。
+#[inline(always)]
+pub fn metrics_exit(t0: u32) {
+    let d = cyc().wrapping_sub(t0);
+    ISR_SUM.store(
+        ISR_SUM.load(Ordering::Relaxed).wrapping_add(d),
+        Ordering::Relaxed,
+    );
+    if d > ISR_MAX.load(Ordering::Relaxed) {
+        ISR_MAX.store(d, Ordering::Relaxed);
+    }
+}
+
+/// 诊断快照：`(isr_n, isr_sum, isr_max, gap_max, dry_rx, dry_tx)`，单位都是周期数。
+pub fn metrics() -> (u32, u32, u32, u32, u32, u32) {
+    (
+        ISR_N.load(Ordering::Relaxed),
+        ISR_SUM.load(Ordering::Relaxed),
+        ISR_MAX.load(Ordering::Relaxed),
+        GAP_MAX.load(Ordering::Relaxed),
+        DRY_RX.load(Ordering::Relaxed),
+        DRY_TX.load(Ordering::Relaxed),
+    )
+}
+
+/// 清空诊断计数（`isr_sum`/`gap_max` 这类是「区间统计」，读一次后清零更直观）。
+pub fn metrics_clear() {
+    ISR_N.store(0, Ordering::Relaxed);
+    ISR_SUM.store(0, Ordering::Relaxed);
+    ISR_MAX.store(0, Ordering::Relaxed);
+    GAP_MAX.store(0, Ordering::Relaxed);
+    DRY_RX.store(0, Ordering::Relaxed);
+    DRY_TX.store(0, Ordering::Relaxed);
+}
 
 pub fn evt_rx() -> u32 {
     EVT_RX.load(Ordering::Relaxed)
@@ -459,8 +572,23 @@ pub fn on_enable<T: Instance>(index: usize, _enabled: bool, dir_in: bool) {
 }
 
 // ───────────────────────── ISR 钩子 ─────────────────────────
+//
+// 三条硬性顺序（改这里之前先读《CH32V307_USBHS_双工带宽问题说明》）：
+//
+// 1. **硬件动作必须在清 `UIF_TRANSFER` 之前**：`UEPn_RX_DMA`/`UEPn_TX_DMA`、`T_LEN`、
+//    `R_TOG`/`T_TOG`、ACK/NAK 就是下一包的数据通路。标志一清，SIE 立刻会拿这套寄存器
+//    去接/发下一包；没更新完就清，下一包会 DMA 覆盖上一包还没被应用读走的数据
+//    （IN 侧则是把上一包原样重发）。这就是「清标志放太早」的危险所在。
+// 2. **清标志要尽早**：`UC_INT_BUSY` 让 SIE 在 `UIF_TRANSFER` 有效期间对所有 token
+//    自动 NAK，这段窗口就是纯粹的线上损失。
+// 3. **纯软件记账放清标志之后**：搬 ready/free、改索引、计数、wake 都只碰 RAM，
+//    放在窗口里只会白白拉长窗口。
+//
+// 于是一包的最短窗口 = 挂下一包要写的那几次 APB（OUT 2 次：DMA + CTRL；IN 3 次：
+// DMA + T_LEN + CTRL）+ 1 次清标志，与「先清标志再挂 DMA」的 40MB+ 实验相比只多这几笔
+// 寄存器写，但数据通路一定是自洽的。
 
-/// ISR：OUT 完成。先挂下一格并改完环，再清 `UIF_TRANSFER`。
+/// ISR：OUT 完成。先挂下一格 + ACK/NAK，再清 `UIF_TRANSFER`，最后才记账。
 /// 返回是否需要 wake（ready 0→1）。
 #[inline(always)]
 pub fn on_out<T: Instance>(index: usize, len: u16) -> bool {
@@ -470,6 +598,7 @@ pub fn on_out<T: Instance>(index: usize, len: u16) -> bool {
         return false;
     }
 
+    // 先把要用的软件状态读出来（纯 RAM，不进窗口之后的部分）。
     compiler_fence(Ordering::Acquire);
     let has = p.fh != p.ft;
     let next = if has {
@@ -477,32 +606,40 @@ pub fn on_out<T: Instance>(index: usize, len: u16) -> bool {
     } else {
         0xFF
     };
+    let done = p.armed;
+    let was_empty = p.rh == p.rt;
+    let tog = p.tog;
+
+    // ① 硬件动作：下一格地址 + 下一包 TOG + ACK/NAK。必须在清标志前完成。
     if has {
         set_rx_dma::<T>(index, p.addrs[next as usize]);
         compiler_fence(Ordering::Release);
-        write_rx_ctrl::<T>(index, p.tog, true);
-        p.tog = !p.tog;
+        write_rx_ctrl::<T>(index, tog, true);
     } else {
-        write_rx_ctrl::<T>(index, p.tog, false);
+        write_rx_ctrl::<T>(index, tog, false);
     }
-
-    let done = p.armed;
-    let was_empty = p.rh == p.rt;
+    // ② 结束 INT_BUSY 窗口。
+    clear_transfer::<T>();
+    // ③ 软件记账。
+    if has {
+        p.armed = next;
+        p.fh = wrap(p.fh);
+        p.stopped = false;
+        p.tog = !tog;
+    } else {
+        p.armed = 0xFF;
+        p.stopped = true;
+        DRY_RX.store(
+            DRY_RX.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
+    }
     if done != 0xFF {
         p.lens[done as usize] = len;
         p.ready[p.rt as usize] = done;
         compiler_fence(Ordering::Release);
         p.rt = wrap(p.rt);
     }
-    if has {
-        p.armed = next;
-        p.fh = wrap(p.fh);
-        p.stopped = false;
-    } else {
-        p.armed = 0xFF;
-        p.stopped = true;
-    }
-    clear_transfer::<T>();
 
     EVT_RX.store(
         EVT_RX.load(Ordering::Relaxed).wrapping_add(1),
@@ -511,8 +648,15 @@ pub fn on_out<T: Instance>(index: usize, len: u16) -> bool {
     was_empty
 }
 
-/// ISR：IN 完成。先挂下一包并改完环，再清 `UIF_TRANSFER`。
-/// 返回是否需要 wake（free 0→1，即队列从满到非满）。
+/// ISR：IN 完成。
+///
+/// **IN 方向故意不把记账挪到清标志之后**（与 `on_out` 不同）：实测同一块板子上
+/// 「先记账再清标志」IN 30.9 MiB/s，「先清标志再记账」只有 27~28 MiB/s，
+/// 而 OUT 方向恰好相反（22.8 → 42.5）。两个方向在这颗片子上的最优点不一样，
+/// 这是量出来的，不是推出来的（见《CH32V307_USBHS_安全提速路径》§5）。
+/// 安全不变量两边一致：清标志前下一包的 DMA/LEN/TOG/ACK 一定已经就位。
+///
+/// 返回是否需要 wake（free 队列到水位，生产者可以一次补一批）。
 #[inline(always)]
 pub fn on_in<T: Instance>(index: usize) -> bool {
     let p = unsafe { tx_mut(index) };
@@ -524,22 +668,18 @@ pub fn on_in<T: Instance>(index: usize) -> bool {
     compiler_fence(Ordering::Acquire);
     let has = p.qh != p.qt;
     let next = if has { p.q[p.qh as usize] } else { 0xFF };
-    if has {
-        set_tx_dma::<T>(
-            index,
-            p.addrs[next as usize],
-            p.lens[next as usize],
-        );
-        compiler_fence(Ordering::Release);
-        write_tx_ctrl::<T>(index, p.tog, true);
-        p.tog = !p.tog;
-    } else {
-        write_tx_ctrl::<T>(index, p.tog, false);
-    }
-
     let done = p.armed;
-    compiler_fence(Ordering::Acquire);
-    let was_full = p.fh == p.ft;
+    let tog = p.tog;
+
+    // ① 硬件动作：下一包的 DMA/长度/TOG/ACK（清标志前必须全部就位）。
+    if has {
+        set_tx_dma::<T>(index, p.addrs[next as usize], p.lens[next as usize]);
+        compiler_fence(Ordering::Release);
+        write_tx_ctrl::<T>(index, tog, true);
+    } else {
+        write_tx_ctrl::<T>(index, tog, false);
+    }
+    // ② 记账（IN 方向上这一段留在清标志之前更快，见函数头）。
     if done != 0xFF {
         p.free[p.ft as usize] = done;
         compiler_fence(Ordering::Release);
@@ -549,17 +689,25 @@ pub fn on_in<T: Instance>(index: usize) -> bool {
         p.armed = next;
         p.qh = wrap(p.qh);
         p.stopped = false;
+        p.tog = !tog;
     } else {
         p.armed = 0xFF;
         p.stopped = true;
+        DRY_TX.store(
+            DRY_TX.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
     }
+    // ③ 结束 INT_BUSY 窗口。
     clear_transfer::<T>();
+    // free 涨到水位才叫醒生产者：一次补一批，减少 executor 轮询次数。
+    let wake = qlen(p.fh, p.ft) >= tx_wake_water(p.n);
 
     EVT_TX.store(
         EVT_TX.load(Ordering::Relaxed).wrapping_add(1),
         Ordering::Relaxed,
     );
-    was_full
+    wake
 }
 
 // ───────────────────────── 零拷贝 TX API ─────────────────────────
@@ -609,6 +757,11 @@ impl<T: Instance> TxPipe<T> {
     }
 
     /// 拿一块空闲 slot 的 DMA buffer。队列满时等 IN 完成腾出槽。
+    ///
+    /// 注意唤醒水位 `TX_WAKE_DIV`：Pending 之后不是「每空出一格就醒」，而是等
+    /// free 攒到 `n / TX_WAKE_DIV` 格才醒一次（见该常量说明）。单包写入的调用方
+    /// （`EndpointIn::write`）在深环上最多多等这个量级的包时间，测速这种「醒一次补一批」
+    /// 的用法才是它的目标场景。
     pub async fn alloc(&self) -> TxBuf {
         let index = self.index;
         poll_fn(|ctx| {
