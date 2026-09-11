@@ -49,6 +49,7 @@ use crate::interrupt::typelevel::Interrupt;
 use crate::usb::{Dir, EndpointBufferAllocator, EndpointData, EndpointDataBuffer, In, Out};
 use crate::{interrupt, Peri, PeripheralType};
 
+pub mod bufmap;
 pub mod control;
 mod endpoint;
 pub use endpoint::Endpoint;
@@ -127,7 +128,10 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
 
             match status.token() {
                 UsbToken::OUT => {
-                    if status.tog_ok() {
+                    // Phase 1 探针（ENABLE=false 时整段被编译掉，热路径零成本）
+                    if bufmap::ENABLE && bufmap::active(ep) {
+                        bufmap::on_out::<T>(ep, status.tog_ok(), r.rx_len().read());
+                    } else if status.tog_ok() {
                         if pipe::is_ring(ep) {
                             let len = r.rx_len().read();
                             // on_out 内改完环再清 UIF_TRANSFER；只在 filled 0→1 时 wake
