@@ -52,6 +52,16 @@ const DBUF_TX: bool = false;
 /// 两者的峰值吞吐要用 `--pad-sweep`/`--metrics` 对比后再定。
 const DBUF_TX_AUTO_TOG: bool = true;
 
+/// RX(OUT) 方向走硬件双缓冲（`UEP_BUF_MOD`，Phase 2）。映射同 TX：
+/// `dbuf[0]`=本方向寄存器(RX_DMA/DATA0)、`dbuf[1]`=对方向寄存器(TX_DMA/DATA1)。
+/// 默认关闭：实测双工合计 单缓冲 36.4 > 双缓冲+软件翻 30.4~31.5 > 双缓冲+AUTO_TOG 26.0。
+/// 打开的收益是 OUT 余量 <55ns → >3.5us（单向吞吐不变），代价是双工合计掉 15~28%，
+/// 因为 OUT 越"永远 ACK"，主机（xHCI）越把 OUT 饿死。单向为主/ISR 要加东西时再开。
+const DBUF_RX: bool = false;
+
+/// RX 双缓冲是否用硬件 `AUTO_TOG` 推进同步位（Phase 1 实测 RX 侧可用）。
+const DBUF_RX_AUTO_TOG: bool = true;
+
 /// TX(IN) 唤醒水位：free 队列涨到 `n / TX_WAKE_DIV` 格才唤醒生产者一次。
 ///
 /// 1 = 每包都唤醒（老行为）。每唤醒一次，executor 都要把整个任务（含 `usb.run()`）
@@ -210,6 +220,11 @@ pub struct RxCtx {
     tog: bool,
     n: u8,
     stopped: bool,
+    // ── 硬件双缓冲（BUF_MODE）状态 ──
+    /// 两个 DMA 寄存器里各挂着哪一格：`dbuf[0]`=RX_DMA(DATA0)、`dbuf[1]`=TX_DMA(DATA1)。
+    dbuf: [u8; 2],
+    /// 硬件下一次会用哪一块（0/1）。
+    cur: u8,
 }
 
 impl RxCtx {
@@ -227,6 +242,8 @@ impl RxCtx {
             tog: false,
             n: 0,
             stopped: false,
+            dbuf: [0xFF, 0xFF],
+            cur: 0,
         }
     }
 
@@ -243,7 +260,10 @@ impl RxCtx {
         self.rt = 0;
         self.armed = 0xFF;
         self.tog = false;
-        self.stopped = false;
+        // 复位/使能之后硬件那边是 NAK，补货补到 `cur` 那块时要记得改回 ACK
+        self.stopped = true;
+        self.dbuf = [0xFF, 0xFF];
+        self.cur = 0;
     }
 
     fn pop_ready(&mut self) -> Option<u8> {
@@ -596,6 +616,76 @@ fn kick_tx<T: Instance>(p: &mut TxCtx, index: usize) -> bool {
     true
 }
 
+#[inline(always)]
+fn set_rx_dma_reg<T: Instance>(index: usize, buf: u8, addr: u32) {
+    if buf == 0 {
+        T::dregs().ep_rx_dma(index - 1).write_value(addr);
+    } else {
+        T::dregs().ep_tx_dma(index - 1).write_value(addr);
+    }
+}
+
+/// RX 双缓冲的 CTRL 写（按 `DBUF_RX_AUTO_TOG` 选自动/软件翻 TOG）。
+#[inline(always)]
+fn write_rx_ctrl_db<T: Instance>(index: usize, data1: bool, ack: bool) {
+    if DBUF_RX_AUTO_TOG {
+        T::dregs().ep_rx_ctrl(index).write(|v| {
+            v.set_mask_uep_r_tog(if data1 {
+                EpTog::DATA1
+            } else {
+                EpTog::DATA0
+            });
+            v.set_mask_uep_r_res(if ack {
+                EpRxResponse::ACK
+            } else {
+                EpRxResponse::NAK
+            });
+            v.set_r_tog_auto(true);
+        });
+    } else {
+        write_rx_ctrl::<T>(index, data1, ack);
+    }
+}
+
+#[inline(always)]
+fn rx_needs_kick(p: &RxCtx) -> bool {
+    p.dbuf[p.cur as usize] == 0xFF || p.dbuf[(p.cur ^ 1) as usize] == 0xFF
+}
+
+/// RX 双缓冲补货：优先补硬件下一个要用的那块。**必须在清标志之后或 CS 里调用。**
+fn rx_refill_db<T: Instance>(p: &mut RxCtx, index: usize) {
+    for b in [p.cur, p.cur ^ 1] {
+        if p.dbuf[b as usize] != 0xFF {
+            continue;
+        }
+        compiler_fence(Ordering::Acquire);
+        if p.fh == p.ft {
+            break;
+        }
+        let slot = p.free[p.fh as usize];
+        p.fh = wrap(p.fh);
+        set_rx_dma_reg::<T>(index, b, p.addrs[slot as usize]);
+        compiler_fence(Ordering::Release);
+        p.dbuf[b as usize] = slot;
+        if b == p.cur {
+            p.armed = slot;
+            if p.stopped {
+                p.stopped = false;
+                write_rx_ctrl_db::<T>(index, p.cur == 1, true);
+            }
+        }
+    }
+}
+
+fn kick_rx_db<T: Instance>(p: &mut RxCtx, index: usize) -> bool {
+    rx_refill_db::<T>(p, index);
+    if p.armed == 0xFF && !p.stopped {
+        p.stopped = true;
+        write_rx_ctrl_db::<T>(index, p.cur == 1, false);
+    }
+    p.armed != 0xFF
+}
+
 fn kick_rx<T: Instance>(p: &mut RxCtx, index: usize) -> bool {
     compiler_fence(Ordering::Acquire);
     if p.fh == p.ft {
@@ -682,7 +772,14 @@ pub fn init_rx<T: Instance>(index: usize, slots: &'static mut [DmaSlot]) -> bool
         RING_BITS.load(Ordering::Relaxed) | (1 << index),
         Ordering::Release,
     );
-    set_buf_mod::<T>(index, false);
+    set_buf_mod::<T>(index, DBUF_RX);
+    if DBUF_RX {
+        T::dregs().ep_rx_ctrl(index).write(|v| {
+            v.set_mask_uep_r_tog(EpTog::DATA0);
+            v.set_mask_uep_r_res(EpRxResponse::NAK);
+            v.set_r_tog_auto(DBUF_RX_AUTO_TOG);
+        });
+    }
     true
 }
 
@@ -740,7 +837,17 @@ pub fn on_enable<T: Instance>(index: usize, _enabled: bool, dir_in: bool) {
         if n == 0 {
             return;
         }
-        set_buf_mod::<T>(index, false);
+        if DBUF_RX {
+            // 同 TX：`bus_reset()` 会清掉 BUF_MODE、`endpoint_set_enabled()` 会关 AUTO_TOG
+            set_buf_mod::<T>(index, true);
+            T::dregs().ep_rx_ctrl(index).write(|v| {
+                v.set_mask_uep_r_tog(EpTog::DATA0);
+                v.set_mask_uep_r_res(EpRxResponse::NAK);
+                v.set_r_tog_auto(DBUF_RX_AUTO_TOG);
+            });
+        } else {
+            set_buf_mod::<T>(index, false);
+        }
     }
 }
 
@@ -763,8 +870,68 @@ pub fn on_enable<T: Instance>(index: usize, _enabled: bool, dir_in: bool) {
 
 /// ISR：OUT 完成。先挂下一格 + ACK/NAK，再清 `UIF_TRANSFER`，最后才记账。
 /// 返回是否需要 wake（ready 0→1）。
+/// ISR：OUT 完成（硬件双缓冲版，Phase 2）。
+///
+/// 两块缓冲预挂、`AUTO_TOG` 由硬件推进 ⇒ 清标志前不写任何寄存器（队列见底时除外），
+/// 补货与记账全部在清标志之后。映射：`dbuf[0]`=RX_DMA(DATA0)、`dbuf[1]`=TX_DMA(DATA1)。
+#[inline(always)]
+fn on_out_db<T: Instance>(index: usize, len: u16) -> bool {
+    let p = unsafe { rx_mut(index) };
+    if p.n == 0 {
+        clear_transfer::<T>();
+        return false;
+    }
+
+    let done = p.dbuf[p.cur as usize];
+    p.cur ^= 1; // AUTO_TOG 已把硬件推进到另一块
+    let next_armed = p.dbuf[p.cur as usize] != 0xFF;
+
+    // ① 窗口：只有"要变 NAK"时才写寄存器
+    if !DBUF_RX_AUTO_TOG {
+        write_rx_ctrl_db::<T>(index, p.cur == 1, next_armed);
+        if !next_armed && !p.stopped {
+            p.stopped = true;
+            DRY_RX.store(
+                DRY_RX.load(Ordering::Relaxed).wrapping_add(1),
+                Ordering::Relaxed,
+            );
+        }
+    } else if !next_armed && !p.stopped {
+        p.stopped = true;
+        write_rx_ctrl_db::<T>(index, p.cur == 1, false);
+        DRY_RX.store(
+            DRY_RX.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
+    }
+    // ② 结束 INT_BUSY 窗口
+    clear_transfer::<T>();
+
+    // ③ 记账 + 补货（窗口外）
+    let was_empty = p.rh == p.rt;
+    if done != 0xFF {
+        p.lens[done as usize] = len;
+        p.ready[p.rt as usize] = done;
+        compiler_fence(Ordering::Release);
+        p.rt = wrap(p.rt);
+    }
+    p.dbuf[p.cur as usize ^ 1] = 0xFF; // 刚空出来的那块
+    rx_refill_db::<T>(p, index);
+    p.armed = p.dbuf[p.cur as usize];
+
+    EVT_RX.store(
+        EVT_RX.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+    was_empty
+}
+
+/// ISR：OUT 完成（单缓冲版，`DBUF_RX=false` 时使用）。
 #[inline(always)]
 pub fn on_out<T: Instance>(index: usize, len: u16) -> bool {
+    if DBUF_RX {
+        return on_out_db::<T>(index, len);
+    }
     let p = unsafe { rx_mut(index) };
     if p.n == 0 {
         clear_transfer::<T>();
@@ -1114,10 +1281,14 @@ impl<T: Instance> RxPipe<T> {
                     len: p.lens[slot as usize],
                 });
             }
-            if p.armed == 0xFF {
+            if rx_needs_kick(p) {
                 with_rx(index, |c| {
-                    if c.armed == 0xFF {
-                        kick_rx::<T>(c, index);
+                    if rx_needs_kick(c) {
+                        if DBUF_RX {
+                            kick_rx_db::<T>(c, index);
+                        } else if c.armed == 0xFF {
+                            kick_rx::<T>(c, index);
+                        }
                     }
                 });
             }
@@ -1133,10 +1304,14 @@ impl<T: Instance> RxPipe<T> {
         core::mem::forget(buf);
         let p = unsafe { rx_mut(index) };
         let was_empty = p.push_free(slot);
-        if was_empty || p.stopped {
+        if was_empty || p.stopped || rx_needs_kick(p) {
             with_rx(index, |c| {
-                if c.armed == 0xFF {
-                    kick_rx::<T>(c, index);
+                if rx_needs_kick(c) {
+                    if DBUF_RX {
+                        kick_rx_db::<T>(c, index);
+                    } else if c.armed == 0xFF {
+                        kick_rx::<T>(c, index);
+                    }
                 }
             });
         }
