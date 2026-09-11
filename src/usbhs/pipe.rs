@@ -271,6 +271,40 @@ fn cyc() -> u32 {
     unsafe { core::ptr::read_volatile(0xE000_F008 as *const u32) }
 }
 
+// ───────────────────── 实验旋钮：INT_BUSY 窗口垫片 ─────────────────────
+//
+// 用来回答「窗口还能长多少才会踩到主机的下一个 token」：在清 `UIF_TRANSFER` 前空转
+// `ISR_PAD_*` 个 SysTick（≈55 ns/tick，见 `cyc()`），扫几档看吞吐从哪里崩。
+// 崩点就是当前版本的真实余量。0 = 关（生产默认）。
+
+static ISR_PAD_RX: AtomicU32 = AtomicU32::new(0);
+static ISR_PAD_TX: AtomicU32 = AtomicU32::new(0);
+
+/// 设置垫片：`rx` 作用于 `on_out`（OUT 方向），`tx` 作用于 `on_in`（IN 方向），单位 SysTick。
+pub fn set_isr_pad(rx: u32, tx: u32) {
+    ISR_PAD_RX.store(rx, Ordering::Relaxed);
+    ISR_PAD_TX.store(tx, Ordering::Relaxed);
+}
+
+/// 读回当前垫片 `(rx, tx)`。
+pub fn isr_pad() -> (u32, u32) {
+    (
+        ISR_PAD_RX.load(Ordering::Relaxed),
+        ISR_PAD_TX.load(Ordering::Relaxed),
+    )
+}
+
+/// 在窗口里空转 `n` 个 SysTick。n=0 时只有一次原子读 + 一次比较。
+#[inline(always)]
+fn pad_window(n: u32) {
+    if n != 0 {
+        let t0 = cyc();
+        while cyc().wrapping_sub(t0) < n {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// 当前周期计数值（用于标定计数器频率：Δcounts / Δt）。
 #[inline(always)]
 pub fn cyc_raw() -> u32 {
@@ -618,7 +652,8 @@ pub fn on_out<T: Instance>(index: usize, len: u16) -> bool {
     } else {
         write_rx_ctrl::<T>(index, tog, false);
     }
-    // ② 结束 INT_BUSY 窗口。
+    // ② 结束 INT_BUSY 窗口（垫片只在实验时非 0）。
+    pad_window(ISR_PAD_RX.load(Ordering::Relaxed));
     clear_transfer::<T>();
     // ③ 软件记账。
     if has {
@@ -698,7 +733,8 @@ pub fn on_in<T: Instance>(index: usize) -> bool {
             Ordering::Relaxed,
         );
     }
-    // ③ 结束 INT_BUSY 窗口。
+    // ③ 结束 INT_BUSY 窗口（垫片只在实验时非 0）。
+    pad_window(ISR_PAD_TX.load(Ordering::Relaxed));
     clear_transfer::<T>();
     // free 涨到水位才叫醒生产者：一次补一批，减少 executor 轮询次数。
     let wake = qlen(p.fh, p.ft) >= tx_wake_water(p.n);

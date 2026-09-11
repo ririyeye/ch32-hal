@@ -54,7 +54,8 @@ pub use endpoint::Endpoint;
 mod pipe;
 pub use pipe::dbg_state as pipe_dbg;
 pub use pipe::{
-    cyc_raw, init_rx, init_tx, metrics, metrics_clear, metrics_init, DmaSlot, RxPipe, TxPipe,
+    cyc_raw, init_rx, init_tx, isr_pad, metrics, metrics_clear, metrics_init, set_isr_pad, DmaSlot,
+    RxPipe, TxPipe,
 };
 /// 只读访问调试计数。
 pub fn evt_rx_count() -> u32 {
