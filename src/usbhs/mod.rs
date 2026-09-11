@@ -55,6 +55,7 @@ mod endpoint;
 pub use endpoint::Endpoint;
 mod pipe;
 pub use pipe::dbg_state as pipe_dbg;
+pub use pipe::tx_dbuf_state as pipe_tx_dbuf;
 pub use pipe::{
     cyc_raw, init_rx, init_tx, isr_pad, metrics, metrics_clear, metrics_init, set_isr_pad, DmaSlot,
     RxPipe, TxPipe,
@@ -148,7 +149,10 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     }
                 }
                 UsbToken::IN => {
-                    if pipe::is_ring(ep) {
+                    // Phase 3 探针（ENABLE=false 时整段被编译掉）
+                    if bufmap::ENABLE && bufmap::active(ep) {
+                        bufmap::on_in::<T>(ep, status.tog_ok());
+                    } else if pipe::is_ring(ep) {
                         // on_in 内改完环再清 UIF_TRANSFER；只在队列从满到非满时 wake
                         if pipe::on_in::<T>(ep) {
                             EP_WAKERS[ep].wake();

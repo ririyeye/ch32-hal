@@ -40,6 +40,18 @@ const QMASK: u8 = 15;
 /// 调试开关：false 时 `init_tx` / `init_rx` 拒绝挂 ring，端点退回单缓冲 legacy 路径。
 pub const RING_ENABLE: bool = true;
 
+/// TX(IN) 方向走硬件双缓冲（`UEP_BUF_MOD` + `AUTO_TOG`，Phase 3）。
+///
+/// 两块缓冲预挂好、TOG 由硬件推进 ⇒ 清标志前**一次寄存器写都不需要**（RES 一直是 ACK），
+/// 补货挪到清标志之后，有整整一包（~17us）的余量。实测：TX 侧 AUTO_TOG 可用
+/// （`--bufmap-tx --bufmap-no-flip --bufmap-auto-tog` → A,B,A,B 交替，TOG_OK 全 1）。
+const DBUF_TX: bool = false;
+
+/// TX 双缓冲是否用硬件 `AUTO_TOG` 推进同步位。
+/// true = 清标志前零写（余量最大，实测 +3.5us 不掉速）；false = 软件每包翻 TOG（窗口里 1 次写）。
+/// 两者的峰值吞吐要用 `--pad-sweep`/`--metrics` 对比后再定。
+const DBUF_TX_AUTO_TOG: bool = true;
+
 /// TX(IN) 唤醒水位：free 队列涨到 `n / TX_WAKE_DIV` 格才唤醒生产者一次。
 ///
 /// 1 = 每包都唤醒（老行为）。每唤醒一次，executor 都要把整个任务（含 `usb.run()`）
@@ -105,6 +117,14 @@ pub struct TxCtx {
     tog: bool,
     n: u8,
     stopped: bool,
+    // ── 硬件双缓冲（BUF_MODE + AUTO_TOG）状态 ──
+    /// 两个 DMA 寄存器里各挂着哪一格：`dbuf[0]`=本方向寄存器(TX_DMA/DATA0)，
+    /// `dbuf[1]`=对方向寄存器(RX_DMA/DATA1)；0xFF = 这格没挂东西。
+    dbuf: [u8; 2],
+    /// 硬件下一次会用哪一块（0/1）。AUTO_TOG 由硬件推进，软件按"每完成一包翻一次"跟随。
+    cur: u8,
+    /// `T_LEN` 影子值（收发共用寄存器，只有变了才写，省一次窗口内写）。
+    tlen: u16,
 }
 
 impl TxCtx {
@@ -122,6 +142,9 @@ impl TxCtx {
             tog: false,
             n: 0,
             stopped: false,
+            dbuf: [0xFF, 0xFF],
+            cur: 0,
+            tlen: 0,
         }
     }
 
@@ -138,7 +161,12 @@ impl TxCtx {
         self.qt = 0;
         self.armed = 0xFF;
         self.tog = false;
-        self.stopped = false;
+        // 复位/使能之后硬件那边是 NAK（`endpoint_set_enabled` 写的），
+        // 所以这里必须是 true：补货补到 `cur` 那块时才记得把它改回 ACK。
+        self.stopped = true;
+        self.dbuf = [0xFF, 0xFF];
+        self.cur = 0;
+        self.tlen = 0;
     }
 
     fn used(&self) -> u8 {
@@ -458,6 +486,96 @@ fn set_buf_mod<T: Instance>(index: usize, on: bool) {
     T::dregs().ep_buf_mod().modify(|v| v.set_buf_mod(index, on));
 }
 
+#[inline(always)]
+fn set_tx_dma_reg<T: Instance>(index: usize, buf: u8, addr: u32) {
+    // buf 0 = 本方向寄存器（TX_DMA / DATA0），1 = 对方向寄存器（RX_DMA / DATA1）
+    if buf == 0 {
+        T::dregs().ep_tx_dma(index - 1).write_value(addr);
+    } else {
+        T::dregs().ep_rx_dma(index - 1).write_value(addr);
+    }
+}
+
+#[inline(always)]
+fn set_t_len<T: Instance>(index: usize, len: u16) {
+    T::dregs().ep_t_len(index).write(|v| v.set_len(len));
+}
+
+/// 双缓冲专用 CTRL 写：保留 `AUTO_TOG`（单缓冲那版会把它关掉）。
+#[inline(always)]
+fn write_tx_ctrl_auto<T: Instance>(index: usize, data1: bool, ack: bool) {
+    T::dregs().ep_tx_ctrl(index).write(|v| {
+        v.set_mask_uep_t_tog(if data1 {
+            EpTog::DATA1
+        } else {
+            EpTog::DATA0
+        });
+        v.set_mask_uep_t_res(if ack {
+            EpTxResponse::ACK
+        } else {
+            EpTxResponse::NAK
+        });
+        v.set_t_tog_auto(true);
+    });
+}
+
+/// 双缓冲的 CTRL 写：按 `DBUF_TX_AUTO_TOG` 选硬件自动翻还是软件翻。
+#[inline(always)]
+fn write_tx_ctrl_db<T: Instance>(index: usize, data1: bool, ack: bool) {
+    if DBUF_TX_AUTO_TOG {
+        write_tx_ctrl_auto::<T>(index, data1, ack);
+    } else {
+        write_tx_ctrl::<T>(index, data1, ack);
+    }
+}
+
+/// 双缓冲是否需要补货：硬件下一个要用的那块、或再下一块空着。
+#[inline(always)]
+fn tx_needs_kick(p: &TxCtx) -> bool {
+    p.dbuf[p.cur as usize] == 0xFF || p.dbuf[(p.cur ^ 1) as usize] == 0xFF
+}
+
+/// 双缓冲补货：优先补硬件下一个要用的那块（`cur`），再补再下一块。写寄存器、必要时
+/// 写 `T_LEN`、必要时把 NAK 改回 ACK。**必须在清标志之后或 CS 里调用。**
+fn tx_refill_db<T: Instance>(p: &mut TxCtx, index: usize) {
+    for b in [p.cur, p.cur ^ 1] {
+        if p.dbuf[b as usize] != 0xFF {
+            continue;
+        }
+        compiler_fence(Ordering::Acquire);
+        if p.qh == p.qt {
+            break;
+        }
+        let slot = p.q[p.qh as usize];
+        p.qh = wrap(p.qh);
+        set_tx_dma_reg::<T>(index, b, p.addrs[slot as usize]);
+        compiler_fence(Ordering::Release);
+        p.dbuf[b as usize] = slot;
+        if b == p.cur {
+            p.armed = slot;
+            // 硬件马上就要用这块：长度要对上，NAK 要改回 ACK
+            if p.tlen != p.lens[slot as usize] {
+                p.tlen = p.lens[slot as usize];
+                set_t_len::<T>(index, p.tlen);
+            }
+            if p.stopped {
+                p.stopped = false;
+                write_tx_ctrl_db::<T>(index, p.cur == 1, true);
+            }
+        }
+    }
+}
+
+/// 双缓冲 kick：把两块尽量挂满（等价于单缓冲的 kick_tx）。
+fn kick_tx_db<T: Instance>(p: &mut TxCtx, index: usize) -> bool {
+    tx_refill_db::<T>(p, index);
+    if p.armed == 0xFF && !p.stopped {
+        p.stopped = true;
+        write_tx_ctrl_db::<T>(index, p.cur == 1, false);
+    }
+    p.armed != 0xFF
+}
+
 /// 空闲时把队首挂上硬件。调用方须保证 `armed == 0xFF`（CS 或 ISR）。
 fn kick_tx<T: Instance>(p: &mut TxCtx, index: usize) -> bool {
     compiler_fence(Ordering::Acquire);
@@ -471,6 +589,7 @@ fn kick_tx<T: Instance>(p: &mut TxCtx, index: usize) -> bool {
     p.armed = slot;
     p.stopped = false;
     set_tx_dma::<T>(index, p.addrs[slot as usize], p.lens[slot as usize]);
+    p.tlen = p.lens[slot as usize];
     compiler_fence(Ordering::Release);
     write_tx_ctrl::<T>(index, p.tog, true);
     p.tog = !p.tog;
@@ -528,7 +647,15 @@ pub fn init_tx<T: Instance>(index: usize, slots: &'static mut [DmaSlot]) -> bool
         RING_BITS.load(Ordering::Relaxed) | (1 << index),
         Ordering::Release,
     );
-    set_buf_mod::<T>(index, false);
+    set_buf_mod::<T>(index, DBUF_TX);
+    if DBUF_TX {
+        // 双缓冲初值：TOG=DATA0、先 NAK，等 kick 挂满两块再 ACK
+        T::dregs().ep_tx_ctrl(index).write(|v| {
+            v.set_mask_uep_t_tog(EpTog::DATA0);
+            v.set_mask_uep_t_res(EpTxResponse::NAK);
+            v.set_t_tog_auto(DBUF_TX_AUTO_TOG);
+        });
+    }
     true
 }
 
@@ -595,6 +722,18 @@ pub fn on_enable<T: Instance>(index: usize, _enabled: bool, dir_in: bool) {
         let n = with_tx(index, |c| c.n);
         if n == 0 {
             return;
+        }
+        if DBUF_TX {
+            // 两件事都会被上层清掉，必须在这里重新断言：
+            // 1) `Bus::bus_reset()` 用 `ep_buf_mod().write_value(default())` 把 BUF_MODE 整片清零；
+            // 2) `Bus::endpoint_set_enabled()` 会把 `t_tog_auto` 写回 false（单缓冲习惯）。
+            // 少了任何一条，硬件就是单缓冲而软件按乒乓记账 —— 表现是"每格发两次、隔格丢"。
+            set_buf_mod::<T>(index, true);
+            T::dregs().ep_tx_ctrl(index).write(|v| {
+                v.set_mask_uep_t_tog(EpTog::DATA0);
+                v.set_mask_uep_t_res(EpTxResponse::NAK);
+                v.set_t_tog_auto(DBUF_TX_AUTO_TOG);
+            });
         }
     } else {
         let n = with_rx(index, |c| c.n);
@@ -683,17 +822,82 @@ pub fn on_out<T: Instance>(index: usize, len: u16) -> bool {
     was_empty
 }
 
-/// ISR：IN 完成。
+/// ISR：IN 完成（硬件双缓冲版，Phase 3）。
+///
+/// 两块缓冲预先挂好、`AUTO_TOG` 由硬件推进 ⇒ 清标志前**什么都不用写**：
+/// 下一包的 DMA 地址、长度、同步位、ACK 全就位，窗口里只剩「读 `INT_ST` + 清标志」。
+/// 补货（写回刚空出来的那块寄存器、搬 free/记账、wake）全部在清标志之后，
+/// 有整整一包（~17us）的余量。唯一例外：队列见底时要在清标志前把 RES 改成 NAK。
+///
+/// 返回是否需要 wake（free 队列到水位，生产者可以一次补一批）。
+#[inline(always)]
+fn on_in_db<T: Instance>(index: usize) -> bool {
+    let p = unsafe { tx_mut(index) };
+    if p.n == 0 {
+        clear_transfer::<T>();
+        return false;
+    }
+
+    let done = p.dbuf[p.cur as usize];
+    p.cur ^= 1; // AUTO_TOG 已经把硬件推进到另一块
+    let next_armed = p.dbuf[p.cur as usize] != 0xFF;
+
+    // ① 窗口。用 AUTO_TOG 时 steady state 一次都不写；软件翻则每包写一次 CTRL。
+    if !DBUF_TX_AUTO_TOG {
+        write_tx_ctrl_db::<T>(index, p.cur == 1, next_armed);
+        if !next_armed {
+            p.stopped = true;
+            DRY_TX.store(
+                DRY_TX.load(Ordering::Relaxed).wrapping_add(1),
+                Ordering::Relaxed,
+            );
+        }
+    } else if !next_armed && !p.stopped {
+        p.stopped = true;
+        write_tx_ctrl_db::<T>(index, p.cur == 1, false);
+        DRY_TX.store(
+            DRY_TX.load(Ordering::Relaxed).wrapping_add(1),
+            Ordering::Relaxed,
+        );
+    }
+    // ② 结束 INT_BUSY 窗口
+    clear_transfer::<T>();
+
+    // ③ 记账 + 补货（窗口外）
+    compiler_fence(Ordering::Acquire);
+    let was_full = p.fh == p.ft;
+    if done != 0xFF {
+        p.free[p.ft as usize] = done;
+        compiler_fence(Ordering::Release);
+        p.ft = wrap(p.ft);
+    }
+    p.dbuf[p.cur as usize ^ 1] = 0xFF; // 刚空出来的那块（等下面的 refill 重新挂）
+    tx_refill_db::<T>(p, index);
+    p.armed = p.dbuf[p.cur as usize];
+
+    let wake = qlen(p.fh, p.ft) >= tx_wake_water(p.n);
+    EVT_TX.store(
+        EVT_TX.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+    let _ = was_full;
+    wake
+}
+
+/// ISR：IN 完成（单缓冲版，`DBUF_TX=false` 时使用）。
 ///
 /// **IN 方向故意不把记账挪到清标志之后**（与 `on_out` 不同）：实测同一块板子上
 /// 「先记账再清标志」IN 30.9 MiB/s，「先清标志再记账」只有 27~28 MiB/s，
 /// 而 OUT 方向恰好相反（22.8 → 42.5）。两个方向在这颗片子上的最优点不一样，
 /// 这是量出来的，不是推出来的（见《CH32V307_USBHS_安全提速路径》§5）。
-/// 安全不变量两边一致：清标志前下一包的 DMA/LEN/TOG/ACK 一定已经就位。
+/// 安全不变量两边一致：清标志前的 DMA/LEN/TOG/ACK 一定已经就位。
 ///
 /// 返回是否需要 wake（free 队列到水位，生产者可以一次补一批）。
 #[inline(always)]
 pub fn on_in<T: Instance>(index: usize) -> bool {
+    if DBUF_TX {
+        return on_in_db::<T>(index);
+    }
     let p = unsafe { tx_mut(index) };
     if p.n == 0 {
         clear_transfer::<T>();
@@ -827,10 +1031,14 @@ impl<T: Instance> TxPipe<T> {
         let p = unsafe { tx_mut(index) };
         p.lens[slot as usize] = len;
         let was_empty = p.push_q(slot);
-        if was_empty {
+        if was_empty || tx_needs_kick(p) {
             with_tx(index, |c| {
-                if c.armed == 0xFF {
-                    kick_tx::<T>(c, index);
+                if tx_needs_kick(c) {
+                    if DBUF_TX {
+                        kick_tx_db::<T>(c, index);
+                    } else if c.armed == 0xFF {
+                        kick_tx::<T>(c, index);
+                    }
                 }
             });
         }
@@ -945,6 +1153,16 @@ impl<T: Instance> RxPipe<T> {
 }
 
 // ───────────────────────── 调试 ─────────────────────────
+
+/// TX 双缓冲内部状态：`(dbuf0, dbuf1, cur, tlen, armed, stopped)`。
+pub fn tx_dbuf_state(index: usize) -> (u8, u8, u8, u16, u8, u8) {
+    if index == 0 || index >= EP_N {
+        return (0xFF, 0xFF, 0, 0, 0xFF, 1);
+    }
+    with_tx(index, |c| {
+        (c.dbuf[0], c.dbuf[1], c.cur, c.tlen, c.armed, c.stopped as u8)
+    })
+}
 
 /// `(n, used_or_rlen, armed, qlen, stopped)`。
 pub fn dbg_state(index: usize) -> (u8, u8, u8, u8, u8) {
