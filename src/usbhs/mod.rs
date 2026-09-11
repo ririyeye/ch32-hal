@@ -32,6 +32,7 @@
 
 use core::future::poll_fn;
 use core::marker::PhantomData;
+use core::sync::atomic::AtomicU32;
 use core::task::Poll;
 
 use bitmaps::Bitmap;
@@ -68,6 +69,20 @@ pub fn evt_tx_count() -> u32 {
 const MAX_NR_EP: usize = 16;
 const EP_MAX_PACKET_SIZE: u16 = 64;
 
+/// 诊断埋点开关。实测 OUT 窗口余量只有 ~1 tick(55ns)，而 `metrics_enter` 自己就要
+/// 几个 tick —— 生产固件必须关掉。关掉时热路径只多一次 Relaxed 读 + 分支（~10ns）。
+static METRICS_ON: AtomicU32 = AtomicU32::new(1);
+
+/// 开关 ISR 埋点（默认开）。关掉后 `metrics()` 不再更新。
+pub fn set_metrics_on(on: bool) {
+    METRICS_ON.store(on as u32, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// 埋点当前是否打开。
+pub fn metrics_on() -> bool {
+    METRICS_ON.load(core::sync::atomic::Ordering::Relaxed) != 0
+}
+
 const NEW_AW: AtomicWaker = AtomicWaker::new();
 static BUS_WAKER: AtomicWaker = NEW_AW;
 static EP_WAKERS: [AtomicWaker; MAX_NR_EP] = [NEW_AW; MAX_NR_EP];
@@ -79,7 +94,12 @@ pub struct InterruptHandler<T: Instance> {
 impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandler<T> {
     unsafe fn on_interrupt() {
         // 计量 ISR 长度：这段就是 `UIF_TRANSFER` 有效、SIE 自动 NAK 的窗口。
-        let _t0 = pipe::metrics_enter();
+        // 埋点本身也在窗口里，所以它可以被运行时关掉（生产应关）。
+        let t0 = if METRICS_ON.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+            Some(pipe::metrics_enter())
+        } else {
+            None
+        };
         let r = T::regs();
         let flag = r.int_fg().read();
 
@@ -143,7 +163,9 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
         if flag.hst_sof() {
             r.int_fg().write(|v| v.set_hst_sof(true));
         }
-        pipe::metrics_exit(_t0);
+        if let Some(t0) = t0 {
+            pipe::metrics_exit(t0);
+        }
     }
 }
 
